@@ -11,7 +11,7 @@ use crate::{
     crypto::{ct_eq, generate_salt, hash_password_for_storage, validate_totp},
     db,
     error::AppError,
-    models::twofactor::{TwoFactor, TwoFactorType},
+    models::twofactor::{RememberTokenData, TwoFactor, TwoFactorType},
     models::user::User,
 };
 
@@ -172,9 +172,16 @@ pub async fn token(
 
             let mut two_factor_remember_token: Option<String> = None;
 
-            if !twofactors.is_empty() {
+            // Filter out Remember type - it's not a real 2FA provider, just a convenience feature
+            let real_twofactors: Vec<&TwoFactor> = twofactors
+                .iter()
+                .filter(|tf| tf.atype != TwoFactorType::Remember as i32)
+                .collect();
+
+            if !real_twofactors.is_empty() {
                 // 2FA is enabled, need to verify
-                let twofactor_ids: Vec<i32> = twofactors.iter().map(|tf| tf.atype).collect();
+                // Only show real 2FA providers to client (not Remember)
+                let twofactor_ids: Vec<i32> = real_twofactors.iter().map(|tf| tf.atype).collect();
                 let selected_id = payload.two_factor_provider.unwrap_or(twofactor_ids[0]);
 
                 let twofactor_code = match &payload.two_factor_token {
@@ -185,10 +192,11 @@ pub async fn token(
                     }
                 };
 
-                // Find the selected twofactor
-                let selected_twofactor = twofactors
+                // Find the selected twofactor from real_twofactors
+                let selected_twofactor = real_twofactors
                     .iter()
-                    .find(|tf| tf.atype == selected_id && tf.enabled);
+                    .find(|tf| tf.atype == selected_id && tf.enabled)
+                    .copied();
 
                 match TwoFactorType::from_i32(selected_id) {
                     Some(TwoFactorType::Authenticator) => {
@@ -212,25 +220,40 @@ pub async fn token(
                         .map_err(|_| AppError::Database)?;
                     }
                     Some(TwoFactorType::Remember) => {
-                        // Check remember token against device
+                        // Remember is handled separately - client sends remember token from previous login
+                        // Check remember token against stored value for this device
                         if let Some(ref device_id) = payload.device_identifier {
-                            let stored_token: Option<Value> = db
-                                .prepare("SELECT data FROM twofactor WHERE user_uuid = ?1 AND atype = ?2")
-                                .bind(&[user.id.clone().into(), (TwoFactorType::Remember as i32).into()])?
-                                .first(None)
-                                .await
-                                .map_err(|_| AppError::Database)?;
+                            // Find remember token in twofactors (not real_twofactors)
+                            let remember_tf = twofactors
+                                .iter()
+                                .find(|tf| tf.atype == TwoFactorType::Remember as i32);
                             
-                            if let Some(token_value) = stored_token {
-                                let stored_data = token_value.get("data")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                            if let Some(tf) = remember_tf {
+                                // Parse stored remember tokens as JSON
+                                let mut token_data = RememberTokenData::from_json(&tf.data);
                                 
-                                // Parse stored remember tokens (format: device_id:token,device_id:token,...)
-                                let expected_token = format!("{}:{}", device_id, twofactor_code);
-                                if !stored_data.contains(&expected_token) {
+                                // Remove expired tokens first
+                                token_data.remove_expired();
+                                
+                                // Validate the provided token
+                                if !token_data.validate(device_id, twofactor_code) {
                                     return Err(AppError::TwoFactorRequired(json_err_twofactor(&twofactor_ids)));
                                 }
+                                
+                                // Update database with cleaned tokens (remove expired)
+                                let updated_data = token_data.to_json();
+                                query!(
+                                    &db,
+                                    "UPDATE twofactor SET data = ?1 WHERE uuid = ?2",
+                                    &updated_data,
+                                    &tf.uuid
+                                )
+                                .map_err(|_| AppError::Database)?
+                                .run()
+                                .await
+                                .map_err(|_| AppError::Database)?;
+                                
+                                // Remember token valid, proceed with login
                             } else {
                                 return Err(AppError::TwoFactorRequired(json_err_twofactor(&twofactor_ids)));
                             }
@@ -278,7 +301,23 @@ pub async fn token(
                 if payload.two_factor_remember == Some(1) {
                     if let Some(ref device_id) = payload.device_identifier {
                         let remember_token = uuid::Uuid::new_v4().to_string();
-                        let token_data = format!("{}:{}", device_id, remember_token);
+                        
+                        // Load existing remember tokens or create new
+                        let remember_tf = twofactors
+                            .iter()
+                            .find(|tf| tf.atype == TwoFactorType::Remember as i32);
+                        
+                        let mut token_data = remember_tf
+                            .map(|tf| RememberTokenData::from_json(&tf.data))
+                            .unwrap_or_default();
+                        
+                        // Remove expired tokens first
+                        token_data.remove_expired();
+                        
+                        // Add/update token for this device
+                        token_data.upsert(device_id.clone(), remember_token.clone());
+                        
+                        let json_data = token_data.to_json();
                         
                         // Store or update remember token
                         query!(
@@ -289,7 +328,7 @@ pub async fn token(
                             uuid::Uuid::new_v4().to_string(),
                             &user.id,
                             TwoFactorType::Remember as i32,
-                            &token_data
+                            &json_data
                         )
                         .map_err(|_| AppError::Database)?
                         .run()
